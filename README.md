@@ -35,8 +35,8 @@ python infer.py --input test/ --weights weights/ --out outputs/
 
 Outputs:
 - `seg_mask/<image stem>.png` — single-channel **uint16**, same size as the image (after EXIF), 0 = background, 1..N = bean id
-- `predictions.json` — one entry per image: `{"image_name", "objects": [{"id", "class", "polygon": [[x, y], ...]}]}`; `id` matches `seg_mask`, polygon = `cv2.findContours(..., CHAIN_APPROX_NONE)` of that mask, full-image pixels
-- `vis/<image stem>.jpg` — overlay for review (half size)
+- `predictions.json` — one entry per image: `{"image_name", "objects": [{"id", "class", "polygon": [[x, y], ...]}]}`; `id` matches `seg_mask`, polygon = outer contour of that mask from `cv2.findContours`, full-image pixels, corner points only (`--poly-simple 1`, default: same shape as listing every boundary pixel; `--poly-simple 0` lists every pixel)
+- `vis/<image stem>.jpg` — overlay for review (half size) with a `#id class` label next to each bean (`--vis-classes 1`, default; `--vis-classes 0` = no labels)
 - `mqtt/<image stem>.json` — the MQTT message for that image: `{"image", "latency_ms", "counts": {good, shell, black, husk, broken, parchment, immature}, "defect_ratio"}`; all 7 keys always present; counts come from the same objects as `predictions.json`/`seg_mask`; `defect_ratio` = non-`good` beans ÷ all beans (0.0 if none); `latency_ms` = that image's processing time (read → write, model load excluded)
 
 Defaults (no extra arguments needed): conf 0.25 · class-agnostic NMS IoU 0.7 · `--refine color --band 20 --band-method dt` (re-decides a ±20 px band around each mask edge by Lab distance from the paper colour, excluding grey shadow) · 4 threads.

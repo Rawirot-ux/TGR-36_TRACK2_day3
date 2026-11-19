@@ -1,3 +1,6 @@
+# Tested on Raspberry Pi 5 (aarch64, Python 3.13.5) with: ncnn 1.0.20261020 · numpy 2.5.5 ·
+# opencv-python-headless 5.1.0.95 · pillow 13.0.0 · PyYAML 6.0.3 · requests 2.34.2 · paho-mqtt 2.2.0
+# (not pinned so pip can pick a wheel for other Python versions)
 ncnn
 numpy
 pillow
