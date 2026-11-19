@@ -4,4 +4,4 @@ pillow
 opencv-python-headless
 PyYAML
 requests
-paho-mqtt
+paho-mqtt>=2,<3

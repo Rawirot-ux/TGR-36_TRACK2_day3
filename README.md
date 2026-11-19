@@ -8,10 +8,10 @@ Model: YOLO26n-seg fine-tuned, exported to NCNN fp32 640 · inference uses only 
 | Path | What |
 |---|---|
 | `infer.py` | **Inference (submission)** — fast, never aborts on mask holes, refines mask edges with image colour (default) |
-| `client.py` | **Day 3 integration** — model loaded + MQTT connected *before* the GET; each image is published to MQTT right after its prediction; then POST `results.json` + `team_36_Day3.zip` |
+| `client.py` | **Day 3 integration** (organiser API docs) — per image: GET `/api/v1/image` → predict → POST `/api/v1/submit` (JSON polygons) → MQTT publish over WebSocket TLS 443; MQTT connected *before* the first GET |
 | `client_config.example.json` | Template for organiser endpoints/credentials — copy to `client_config.json` (git-ignored, never committed) |
 | `train.py` | Reproduces `weights/best.pt` (2 training stages + NCNN export) |
-| `weights/best.pt` | Trained model (Day 3 stage-3 `last.pt` = run E1, md5 `245cc0b18d41e7e5318e1eae3843c8f6`) |
+| `weights/best.pt` | Trained model (Day 3 stage-3 `last.pt` = run E3, md5 `f122e708d7a76dcec172bb3ef65ae8f1`) |
 | `weights/best_ncnn_model/` | NCNN export used by inference (`model.ncnn.param/.bin`, `metadata.yaml`, imgsz 640) |
 | `requirements.txt` | Inference + client dependencies (Pi) |
 
@@ -45,33 +45,39 @@ Defaults (no extra arguments needed): conf 0.25 · class-agnostic NMS IoU 0.7 ·
 ## Run the Day 3 client (HTTP + MQTT)
 
 ```bash
-cp client_config.example.json client_config.json   # fill in organiser URLs / broker / topic / user
-export MQTT_PASSWORD='...'                          # or put it in client_config.json (git-ignored)
-python client.py --config client_config.json --infer infer.py --weights weights/ --out outputs/ --repo .
+cp client_config.example.json client_config.json   # http_url, team_id, track (Embedded|EdgeAI|Market), event
+export HTTP_TOKEN='...'   # team website login password (HTTP Bearer) — or "http_token" in client_config.json
+export MQTT_KEY='...'     # key generated on the website (MQTT password + topic) — or "mqtt_key"
+python client.py --config client_config.json --infer infer.py --weights weights/ --out outputs/ --count 3
+python client.py --config client_config.json --infer infer.py --weights weights/ --out outputs/ --count N --api-mode test
 ```
 
-Organiser rule (19 Nov): Day 3 latency = from the HTTP release of the images until the MQTT message arrives, and all marks are submitted over HTTP. So the default `--mode stream`:
+`client_config.json` is git-ignored (this repo is public): never commit credentials. Default `--api-mode train` (unlimited); `test` uses the quota and must be given explicitly.
 
-0. loads the NCNN model, runs a warm-up and connects to the MQTT broker **before** requesting images
-1. GET `get_url` → `input/` (zip, single image, or JSON list of URLs; with a list, each image is processed as soon as it is downloaded)
-2. per image: predict → **publish MQTT immediately** → write `outputs/mqtt/<stem>.json`; `seg_mask/` and `vis/` are written in a background thread
-3. after the last image: `outputs/predictions.json` (same writer as `infer.py`), check that every MQTT count matches it, then POST `results.json` + `team_36_Day3.zip` while waiting for MQTT acknowledgements (unacknowledged messages are re-sent)
-4. HTTP and MQTT are independent: a broker failure never blocks the HTTP submission; exit code 1 if either failed
+0. load the NCNN model, warm up, connect MQTT once (`tesa-score.c333m.site:443`, WebSocket TLS, path `/mqtt/`, MQTTv5, user = team id, password = MQTT key) and read `GET /api/v1/stats` — all **before** the first image; if MQTT cannot connect the client stops before using any quota (`--skip-mqtt` = HTTP only)
+1. per image (`--count` times): `GET /api/v1/image?mode=…` → `X-Image-ID`, `X-Image-Name` + image bytes, decoded in memory (EXIF-transposed)
+2. predict → **POST `/api/v1/submit` immediately** `{"img_id", "predictions": {"image_name", "objects": [{"id","class","polygon"}]}}` — the server's `duration_seconds` (image sent → JSON received) is the organiser's latency
+3. MQTT publish to `/event/<MQTT_KEY>/<TRACK>/<EVENT>` `{"image","latency_ms","counts","defect_ratio"}` and wait for the QoS 1 ack (one reconnect + resend on failure)
+4. `outputs/mqtt/<stem>.json`; `seg_mask/` and `vis/` are written in a background thread; at the end `outputs/predictions.json`, a check that every MQTT count matches it, and `outputs/client_times.csv` (per-image GET / decode / predict / POST / MQTT seconds, HTTP status, `duration_seconds`) plus its median
 
-The prediction functions are imported from `infer.py`, so `outputs/` is byte-identical to running `python infer.py --input input/ --weights weights/ --out outputs/` (except the measured `latency_ms`).
-`--mode batch` (fallback) runs `infer.py` as a subprocess on all images first, then publishes and POSTs.
+HTTP status: 401 / 403 (quota full or mode closed) / 503 = stop · 409 (duplicate `img_id`) = skip that image · 408 (too late) = logged, continue. Exit code 1 if any image failed or the run stopped early.
+The prediction functions are imported from `infer.py`, so `outputs/` is byte-identical to running `infer.py` on the same images (except the measured `latency_ms`). If the server sends the same image name twice, both are submitted; local files keep the latest.
 
-Options: `--local-input <folder>` skip GET · `--mode batch --skip-infer` resend existing outputs · `--only http|mqtt` · `--retries` · `--timeout`.
+Options: `--skip-mqtt` · `--save-input <dir>` (keep the raw downloaded images, written after POST/MQTT, outside `--out`) · `--timeout` (s, per HTTP request / MQTT ack, default 30) · `--infer-extra "--conf 0.3"`.
 
-## Day 3 model (E1)
+## Day 3 model (E3)
 
-Stage 3: fine-tuned from the Day 2 model (stage-2 `last.pt`) for 40 epochs at 640 on 293 images: the 140 Day 2 touching piles + 13 of the 16 Day 3 organiser photos + 140 synthetic mixed-class piles made only from those 13 photos (same hyper-parameters as stage 2). The other 3 Day 3 photos (`Mixed_square2`, `Mixed_grid1`, `Mixed_triangle4`, 23 beans) are never trained on.
+Stage 3: fine-tuned from the Day 2 model (stage-2 `last.pt`) for 40 epochs at 640 (AdamW lr0 0.001, batch 8, seed 0, `last.pt` used) on 433 images: the 140 Day 2 touching piles + 13 of the 16 Day 3 organiser photos + 140 synthetic mixed-class piles (15–35 beans) + 140 dense overlapping piles (35–50 beans, up to 55 % occlusion), all piles made only from those 13 photos. The other 3 Day 3 photos (`Mixed_square2`, `Mixed_grid1`, `Mixed_triangle4`, 23 beans) are never trained on. E1 (same settings without the 140 dense piles) is kept as the fallback.
 
-| Test set (default inference) | Day 2 model | **Day 3 model (E1)** |
-|---|---|---|
-| 3 held-out Day 3 photos, 23 beans: IoU+count score /15 | 14.46 | **14.71** |
-| 30 synthetic mixed-class piles from those 23 beans, 745 beans: /15 | 4.96 | **12.28** |
-| 70 touching piles from held-out Day 1 grid photos, 1,971 beans: /15 | 14.42 | 14.39 |
+| Test set (default inference, IoU+count score /15) | Day 2 model | E1 | **E3 (submitted)** |
+|---|---|---|---|
+| 3 held-out Day 3 photos, 23 beans | 14.46 | 14.71 | **14.71** (class correct 16/23 vs 10/23) |
+| 30 synthetic mixed-class piles from those 23 beans, 745 beans | 4.96 | 12.28 | **12.68** |
+| 30 dense overlapping piles from those 23 beans, 1,272 beans | 3.19 | 10.11 | **11.23** |
+| 70 touching piles from held-out Day 1 grid photos, 1,971 beans | 14.42 | 14.39 | **14.48** |
+| 3 external photos (Amostra 100g v13, CC BY 4.0), 798 beans | — | 5.36 | **7.41** |
+
+Raspberry Pi, `infer.py` median per image on 3 dense piles (read + infer + write, model load excluded): E1 0.77 s · E3 0.77 s.
 
 ## Pipeline (per image)
 

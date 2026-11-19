@@ -1,123 +1,61 @@
 #!/usr/bin/env python3
-"""client.py — Day 3: รับภาพทาง HTTP → ทาย → publish MQTT ทีละภาพทันที → POST results.json + zip ทาง HTTP
+"""client.py — Day 3 (ตามเอกสาร API ผู้จัด day3_brief/API_DOCS.md): GET ภาพทีละภาพ → ทาย → POST ผลทันที → MQTT
 
-ผู้จัด (19 พ.ย.): latency Day 3 = นับตั้งแต่ HTTP ส่งภาพ จน MQTT กลับมา · คะแนนทั้งหมดส่งผ่าน HTTP (ไม่ส่ง = 0)
-→ โหมด stream (ค่าเริ่ม):
-  0. โหลดโมเดล + อุ่นเครื่อง + ต่อ MQTT ให้พร้อม **ก่อน** GET (ไม่นับเวลานี้เข้า latency)
-  1. GET ภาพ (zip / ภาพเดี่ยว / JSON รายการ URL — ถ้าเป็นรายการ จะทายภาพที่โหลดเสร็จก่อนเลย)
-  2. แต่ละภาพ: ทาย → publish MQTT ทันที → เขียน mqtt/<stem>.json → seg_mask/vis เขียนในเธรดเบื้องหลัง
-  3. ครบทุกภาพ: predictions.json (รูปแบบเดียวกับ infer.py) → ตรวจ counts ตรงกัน → POST results.json + team_XX_Day3.zip
-     พร้อมกับรอยืนยัน MQTT (ส่งซ้ำข้อความที่ไม่ผ่าน)
-  ใช้ฟังก์ชันจาก infer.py ตัวเดียวกัน → seg_mask/predictions.json/mqtt เหมือนรัน infer.py เองทุกไบต์ (ยกเว้น latency_ms)
-โหมด batch (สำรอง): GET ทั้งหมด → รัน infer.py แบบ subprocess → publish + POST ขนานกัน
+ลำดับ (ต่อ 1 ภาพ):
+  1. GET  {http_url}/api/v1/image?mode=<train|test>   (Bearer = รหัสล็อกอินเว็บของทีม) → ไบต์ภาพ + X-Image-ID / X-Image-Name
+  2. decode ในหน่วยความจำ (exif_transpose) → inf.predict (ฟังก์ชันจาก infer.py ตัวเดียวกับงานส่ง)
+  3. POST {http_url}/api/v1/submit  JSON {"img_id", "predictions": {"image_name", "objects"}}  **ก่อน MQTT**
+     → เซิร์ฟเวอร์ตอบ duration_seconds = latency ที่ผู้จัดใช้ (ภาพส่งเสร็จ → ได้ JSON)
+  4. MQTT publish (WebSocket TLS 443 path /mqtt/, MQTTv5, ต่อครั้งเดียวก่อนเริ่ม) แล้วรอ ack
+  5. mqtt/<stem>.json + seg_mask/vis (เธรดเบื้องหลัง) · จบ: predictions.json + ตรวจ counts + client_times.csv
 
-ค่าที่ผู้จัดประกาศ (URL, ชื่อช่อง form, broker, topic, user/password) อยู่ในไฟล์ --config (JSON)
-ไฟล์ config มีรหัสผ่าน → ห้าม commit (repo เป็น public) · รหัสผ่านใส่ทาง env MQTT_PASSWORD / HTTP_TOKEN ได้
-ดู client_config.example.json
+ก่อน GET ภาพแรก: โหลดโมเดล + อุ่นเครื่อง + ต่อ MQTT (ต่อไม่ได้ = หยุด ไม่เสียโควตา test) + GET /api/v1/stats
+สถานะ HTTP: 401/403/503 = หยุด · 409 (img_id ซ้ำ) = ข้ามภาพนั้น · 408 (ส่งช้า) = จดแล้วไปต่อ · มีภาพไหนไม่ผ่าน → exit 1
+
+ค่าทีม/URL อยู่ใน --config (ดู client_config.example.json) · รหัส: env HTTP_TOKEN / MQTT_KEY หรือช่อง http_token /
+mqtt_key ในไฟล์ config (client_config.json อยู่ใน .gitignore — repo เป็น public ห้าม commit) · สคริปต์ไม่พิมพ์รหัส
 
 ใช้:
-  python client.py --config client_config.json --infer infer.py --weights weights/ --out outputs/ --repo .
-  python client.py ... --local-input test_images/      # ข้าม GET (ทดสอบ)
-  python client.py ... --mode batch                    # สำรอง: เรียก infer.py ทั้งชุดแล้วค่อยส่ง
-  python client.py ... --mode batch --skip-infer       # ส่งผลที่มีอยู่แล้วใน --out ซ้ำ
+  python client.py --config client_config.json --infer infer.py --weights weights/ --out outputs/ --count 3
+  python client.py ... --api-mode test --count N      # โหมด test (กินโควตา) ต้องใส่เอง
+  python client.py ... --skip-mqtt                     # ทดสอบ HTTP อย่างเดียว
+  python client.py ... --save-input ~/day3_rehearsal/r1  # เก็บภาพที่ได้ไว้ดูทีหลัง (ไม่กระทบ duration_seconds)
 """
 import argparse
+import csv
 import importlib.util
 import io
 import json
 import os
 import shlex
-import subprocess
+import ssl
+import statistics
 import sys
 import threading
 import time
-import zipfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
 import requests
 
-EXT = {".jpg", ".jpeg", ".png"}
-ZIP_SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "input", ".idea", ".vscode"}
-ZIP_SKIP_FILES = {".DS_Store"}
-T0 = time.perf_counter()
+TRACKS = {"Embedded", "EdgeAI", "Market"}
+STOP_STATUS = {401: "รหัส HTTP (Bearer) ผิด", 403: "โควตาเต็ม หรือโหมดนี้ยังไม่เปิด", 503: "ผู้จัดหยุดระบบชั่วคราว"}
+CSV_COLS = ["i", "image_name", "img_id", "get_s", "decode_s", "predict_s", "post_s", "http_status",
+            "duration_seconds", "mqtt_s", "mqtt_ok", "n_objects"]
 
 
 def log(tag, msg):
-    print(f"[{time.strftime('%H:%M:%S')} +{time.perf_counter() - T0:6.2f}s] [{tag}] {msg}", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
 
 
-def retry(tag, n, fn):
-    for i in range(1, n + 1):
-        try:
-            return fn()
-        except Exception as e:  # noqa: BLE001
-            log(tag, f"ครั้งที่ {i}/{n} ล้ม: {e}")
-            if i == n:
-                raise
-            time.sleep(min(2 * i, 5))
+def load_infer(path):
+    spec = importlib.util.spec_from_file_location("infer_mod", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def headers(cfg):
-    h = dict(cfg.get("http_headers") or {})
-    tok = os.environ.get("HTTP_TOKEN") or cfg.get("http_token")
-    if tok:
-        h.setdefault("Authorization", f"Bearer {tok}")
-    return h
-
-
-def _get(url, hdr, timeout):
-    r = requests.get(url, headers=hdr, timeout=timeout)
-    r.raise_for_status()
-    return r
-
-
-# ---------- 1. รับภาพ ----------
-def fetch_iter(cfg, dest, timeout, retries):
-    """GET get_url แล้ว yield path ภาพทีละภาพเมื่อพร้อม · รองรับ zip / ภาพเดี่ยว / JSON รายการ
-    (list ของ URL/ชื่อไฟล์ หรือ dict ที่มี key images/files/urls/data) — รูปแบบจริงตามเอกสารผู้จัด"""
-    dest.mkdir(parents=True, exist_ok=True)
-    hdr, url = headers(cfg), cfg["get_url"]
-    r = retry("GET", retries, lambda: _get(url, hdr, timeout))
-    ctype = r.headers.get("Content-Type", "").lower()
-    log("GET", f"{r.status_code} {ctype or '-'} {len(r.content) / 1e6:.2f} MB")
-    if "zip" in ctype or r.content[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-            names = []
-            for m in z.infolist():
-                name = Path(m.filename).name
-                if not m.is_dir() and Path(name).suffix.lower() in EXT and not name.startswith("."):
-                    (dest / name).write_bytes(z.read(m))
-                    names.append(name)
-        for name in sorted(names, key=str.casefold):
-            yield dest / name
-        return
-    if ctype.startswith("image/"):
-        name = Path(urlparse(url).path).name or "image.jpg"
-        (dest / name).write_bytes(r.content)
-        yield dest / name
-        return
-    data = r.json()
-    if isinstance(data, dict):
-        data = next((data[k] for k in ("images", "files", "urls", "data") if k in data), None)
-    if not isinstance(data, list):
-        raise SystemExit(f"Error: ไม่รู้จักรูปแบบคำตอบ GET: {r.text[:300]}")
-    for item in data:
-        u = item if isinstance(item, str) else (item.get("url") or item.get("image_url") or item.get("name"))
-        name = Path(urlparse(u).path).name if isinstance(item, str) else (item.get("name") or Path(urlparse(u).path).name)
-        full = urljoin(url if url.endswith("/") else url + "/", u)
-        ri = retry("GET", retries, lambda: _get(full, hdr, timeout))
-        (dest / name).write_bytes(ri.content)
-        yield dest / name
-
-
-def local_iter(folder):
-    for p in sorted((p for p in folder.iterdir() if p.suffix.lower() in EXT), key=lambda p: p.name.casefold()):
-        yield p
-
-
-# ---------- ตรวจ outputs ----------
 def check_outputs(out, n_images):
     preds = json.loads((out / "predictions.json").read_text(encoding="utf-8"))
     msgs = sorted((out / "mqtt").glob("*.json"))
@@ -132,121 +70,139 @@ def check_outputs(out, n_images):
         if len(d["counts"]) != 7 or any(d["counts"][k] != cnt.get(k, 0) for k in d["counts"]):
             raise SystemExit(f"Error: counts ใน {m.name} ไม่ตรง predictions.json")
     log("CHECK", f"predictions {len(preds)} ภาพ = mqtt {len(msgs)} ไฟล์ · counts ตรงกันทุกภาพ")
-    return msgs
 
 
-# ---------- HTTP POST ----------
-def make_zip(repo, out, team):
-    """team_XX_Day3.zip ของ repo (รวม outputs/) ไม่เอา .git / __pycache__ / ภาพ input / config ที่มีรหัส"""
-    zpath = out.parent / f"team_{team}_Day3.zip"
-    root = f"team_{team}_day3"
-    zpath.unlink(missing_ok=True)
-    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in sorted(repo.rglob("*")):
-            rel = p.relative_to(repo)
-            if p.is_dir() or p == zpath or p.name in ZIP_SKIP_FILES or p.suffix == ".zip":
-                continue
-            if any(part in ZIP_SKIP_DIRS for part in rel.parts) or (
-                    p.name.startswith("client_config") and p.name != "client_config.example.json"):
-                continue
-            z.write(p, f"{root}/{rel}")
-    return zpath
+def load_config(path, skip_mqtt):
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["http_token"] = os.environ.get("HTTP_TOKEN") or cfg.get("http_token", "")
+    cfg["mqtt_key"] = os.environ.get("MQTT_KEY") or cfg.get("mqtt_key", "")
+    need = ["http_url", "http_token"] + ([] if skip_mqtt else ["team_id", "track", "event", "mqtt_host", "mqtt_key"])
+    miss = [k for k in need if not str(cfg.get(k, "")).strip() or "<" in str(cfg.get(k, ""))]
+    if miss:
+        raise SystemExit(f"Error: config ขาดค่า {miss} (รหัสใส่ทาง env HTTP_TOKEN / MQTT_KEY ได้)")
+    if not skip_mqtt and cfg["track"] not in TRACKS:
+        raise SystemExit(f"Error: track ต้องเป็น {sorted(TRACKS)} (ตัวพิมพ์ใหญ่เล็กตรง)")
+    cfg["http_url"] = cfg["http_url"].rstrip("/")
+    return cfg
 
 
-def task_http(cfg, a, result):
-    try:
-        zpath = make_zip(a.repo, a.out, cfg["team"])
-        log("HTTP", f"zip {zpath.name} {zpath.stat().st_size / 1e6:.1f} MB")
-        res_bytes = (a.out / "predictions.json").read_bytes()
-
-        def post():
-            files = {cfg.get("post_results_field", "results"): ("results.json", res_bytes, "application/json"),
-                     cfg.get("post_zip_field", "zip"): (zpath.name, zpath.read_bytes(), "application/zip")}
-            r = requests.post(cfg["post_url"], files=files, data=cfg.get("post_extra_fields") or {},
-                              headers=headers(cfg), timeout=a.timeout)
-            log("HTTP", f"POST {r.status_code}: {r.text[:300]}")
-            r.raise_for_status()
-            return r
-        retry("HTTP", a.retries, post)
-        result["http"] = True
-    except Exception as e:  # noqa: BLE001
-        log("HTTP", f"ล้ม: {e}")
-        result["http"] = False
-
-
-# ---------- MQTT ----------
+# ---------- MQTT (ค่าการต่อลอกจาก day3_brief/client_test.py ของผู้จัด) ----------
 class Mqtt:
-    def __init__(self, cfg, a):
-        import paho.mqtt.client as mqtt
-        self.cfg, self.a, self.infos = cfg, a, {}
-        cid = f"team{cfg['team']}-{os.getpid()}"
-        try:
-            self.c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=cid)
-        except AttributeError:  # paho 1.x
-            self.c = mqtt.Client(client_id=cid)
-        if cfg.get("mqtt_user"):
-            self.c.username_pw_set(cfg["mqtt_user"], os.environ.get("MQTT_PASSWORD") or cfg.get("mqtt_password") or None)
-        if cfg.get("mqtt_tls"):
-            self.c.tls_set()
-        self.c.loop_start()
+    def __init__(self, cfg, timeout):
+        self.cfg, self.timeout = cfg, timeout
+        self.topic = f"/event/{cfg['mqtt_key']}/{cfg['track']}/{cfg['event']}"
+        self.client = None
 
     def connect(self):
-        def once():
-            self.c.connect(self.cfg["mqtt_host"], int(self.cfg.get("mqtt_port", 1883)), keepalive=30)
-            end = time.time() + 10
-            while not self.c.is_connected() and time.time() < end:
-                time.sleep(0.05)
-            if not self.c.is_connected():
-                raise RuntimeError("broker ไม่ตอบรับใน 10 s (host/port/user/password/TLS ผิด?)")
-            log("MQTT", f"เชื่อมต่อ {self.cfg['mqtt_host']}:{self.cfg.get('mqtt_port', 1883)} แล้ว")
-        retry("MQTT", self.a.retries, once)
+        import paho.mqtt.client as mqtt
+        self.mqtt = mqtt
+        self.connected, self.lock, self.acked, self.errors = threading.Event(), threading.Lock(), {}, []
 
-    def publish(self, name, payload):
-        """ส่งทันที ไม่รอยืนยัน (ยืนยันทีหลังใน finish)"""
+        def on_connect(client, userdata, flags, reason_code, properties):
+            if reason_code.is_failure:
+                self.errors.append(str(reason_code))
+            self.connected.set()
+
+        def on_publish(client, userdata, mid, reason_code, properties):
+            with self.lock:
+                self.acked[mid] = None if not reason_code.is_failure else str(reason_code)
+
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"{self.cfg['team_id']}:python-{uuid.uuid4().hex[:12]}",
+                        transport="websockets", protocol=mqtt.MQTTv5, reconnect_on_failure=False)
+        c.username_pw_set(self.cfg["team_id"], self.cfg["mqtt_key"])
+        c.ws_set_options(path="/mqtt/")
+        c.tls_set_context(ssl.create_default_context())
+        c.connect_timeout = 10
+        c.on_connect, c.on_publish = on_connect, on_publish
+        self.client = c
+        c.connect(self.cfg["mqtt_host"], int(self.cfg.get("mqtt_port", 443)), keepalive=60)
+        c.loop_start()
+        if not self.connected.wait(15):
+            self.close()
+            raise RuntimeError("ต่อ MQTT ไม่ทันใน 15 s (ตรวจ host)")
+        if self.errors:
+            self.close()
+            raise RuntimeError("MQTT ปฏิเสธการล็อกอิน: " + self.errors[0])
+
+    def _publish_once(self, payload):
+        r = self.client.publish(self.topic, payload, qos=1, retain=False)
+        if r.rc != self.mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError("publish ไม่ได้: " + self.mqtt.error_string(r.rc))
+        end = time.monotonic() + self.timeout
+        while time.monotonic() < end:
+            with self.lock:
+                if r.mid in self.acked:
+                    err = self.acked.pop(r.mid)
+                    if err:
+                        raise RuntimeError("broker ปฏิเสธข้อความ: " + err)
+                    return
+            time.sleep(0.005)
+        raise RuntimeError(f"ไม่ได้ ack ใน {self.timeout:.0f} s")
+
+    def publish(self, payload):
+        """คืน (ok, ข้อความ) · ล้มครั้งแรก → ต่อใหม่ 1 ครั้งแล้วส่งซ้ำ"""
+        if len(payload) > 65536:
+            return False, "payload เกิน 64 KiB"
         try:
-            self.infos[name] = (payload, self.c.publish(self.cfg["mqtt_topic"], payload, qos=int(self.cfg.get("mqtt_qos", 1))))
+            self._publish_once(payload)
+            return True, ""
         except Exception as e:  # noqa: BLE001
-            log("MQTT", f"{name} publish ล้ม: {e}")
-            self.infos[name] = (payload, None)
-
-    def finish(self, result):
-        ok = 0
-        for name, (payload, info) in self.infos.items():
-            def wait(info=info, payload=payload):
-                if info is None or not self._wait(info):
-                    info = self.c.publish(self.cfg["mqtt_topic"], payload, qos=int(self.cfg.get("mqtt_qos", 1)))
-                    if not self._wait(info):
-                        raise RuntimeError(f"ไม่ได้รับยืนยัน rc={info.rc}")
-            try:
-                retry("MQTT", self.a.retries, wait)
-                ok += 1
-            except Exception:  # noqa: BLE001
-                log("MQTT", f"{name} ✗")
-        self.c.loop_stop()
-        self.c.disconnect()
-        log("MQTT", f"ยืนยันแล้ว {ok}/{len(self.infos)}")
-        result["mqtt"] = bool(self.infos) and ok == len(self.infos)
-
-    def _wait(self, info):
+            log("MQTT", f"ส่งไม่ผ่าน ({e}) — ต่อใหม่แล้วส่งซ้ำ 1 ครั้ง")
         try:
-            info.wait_for_publish(timeout=self.a.timeout)
-        except Exception:  # noqa: BLE001
-            return False
-        return info.is_published()
+            self.close()
+            self.connect()
+            self._publish_once(payload)
+            return True, "ส่งซ้ำผ่าน"
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+
+    def close(self):
+        if self.client is not None:
+            try:
+                self.client.disconnect()
+                self.client.loop_stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.client = None
 
 
-# ---------- โหมด stream ----------
-def load_infer(path):
-    spec = importlib.util.spec_from_file_location("infer_mod", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# ---------- HTTP ----------
+def get_stats(s, cfg, timeout):
+    try:
+        r = s.get(f"{cfg['http_url']}/api/v1/stats", timeout=timeout)
+        if r.status_code == 401:
+            raise SystemExit("Error: /stats ตอบ 401 รหัส HTTP (Bearer) ผิด — หยุดก่อน GET ภาพ")
+        if r.status_code != 200:
+            log("STATS", f"HTTP {r.status_code} (ไม่หยุด)")
+            return None
+        d = r.json()
+        log("STATS", f"train {d.get('train_mode')} · test {d.get('test_mode')}")
+        return d
+    except Exception as e:  # noqa: BLE001
+        log("STATS", f"อ่านไม่ได้ ({e}) (ไม่หยุด)")
+        return None
 
 
-def run_stream(cfg, a):
+def post_submit(s, cfg, body, timeout):
+    """คืน (status, json|None) · ต่อเซิร์ฟเวอร์ไม่ได้ → ลองซ้ำ 1 ครั้ง (ถ้าได้ 409 ตอนซ้ำ = ครั้งแรกอาจบันทึกแล้ว)"""
+    for attempt in (1, 2):
+        try:
+            r = s.post(f"{cfg['http_url']}/api/v1/submit", json=body, timeout=timeout)
+            try:
+                d = r.json()
+            except ValueError:
+                d = {"raw": r.text[:200]}
+            return r.status_code, d
+        except requests.RequestException as e:
+            log("POST", f"ส่งไม่ได้ ({type(e).__name__}) ครั้งที่ {attempt}")
+    return 0, None
+
+
+def run(cfg, a):
     import cv2
     import numpy as np
     from PIL import Image, ImageOps
+
     inf = load_infer(a.infer)
     ia = inf.build_parser().parse_args(["--input", ".", "--weights", str(a.weights), "--out", str(a.out)]
                                        + shlex.split(a.infer_extra))
@@ -257,100 +213,124 @@ def run_stream(cfg, a):
     inf.clear_out(a.out)
     for d in ("seg_mask", "vis", "mqtt"):
         (a.out / d).mkdir()
+
     mq = None
-    if a.only in ("both", "mqtt"):
+    if not a.skip_mqtt:
+        mq = Mqtt(cfg, a.timeout)
         try:
-            mq = Mqtt(cfg, a)
             mq.connect()
         except Exception as e:  # noqa: BLE001
-            log("MQTT", f"ต่อไม่ได้ ({e}) — ทำ HTTP ต่อ")
-            mq = None
-    log("READY", f"โหลดโมเดล imgsz {imgsz} + MQTT {'พร้อม' if mq else 'ไม่พร้อม'} · เริ่มรับภาพ")
+            raise SystemExit(f"Error: MQTT ต่อไม่ได้ ({e}) — หยุดก่อน GET (ใช้ --skip-mqtt ถ้าจะทดสอบ HTTP อย่างเดียว)")
+    s = requests.Session()
+    s.headers["Authorization"] = f"Bearer {cfg['http_token']}"
+    stats = get_stats(s, cfg, a.timeout)
+    if a.api_mode == "test" and stats and isinstance(stats.get("test_mode"), dict):
+        left = stats["test_mode"].get("remaining_attempts")
+        if isinstance(left, int) and left < a.count:
+            log("STATS", f"เตือน: โควตา test เหลือ {left} < --count {a.count}")
+    log("READY", f"โมเดล imgsz {imgsz} · MQTT {'พร้อม' if mq else 'ข้าม (--skip-mqtt)'} · "
+                 f"โหมด {a.api_mode} · {a.count} ภาพ")
 
-    src = local_iter(a.local_input) if a.local_input else fetch_iter(
-        cfg, (a.work or a.out.parent / "input").resolve(), a.timeout, a.retries)
     pool = ThreadPoolExecutor(max_workers=1)
-    pending, preds, seen = [], [], set()
-    for f in src:
-        t0 = time.perf_counter()
-        if f.stem.casefold() in seen:
-            log("IMG", f"ข้าม {f.name}: ชื่อซ้ำ")
-            continue
+    pending, preds, rows, failed, stop = [], {}, [], 0, ""
+    for i in range(1, a.count + 1):
+        row = {k: "" for k in CSV_COLS}
+        row["i"] = i
+        t = time.perf_counter()
         try:
-            with Image.open(f) as im:
+            r = s.get(f"{cfg['http_url']}/api/v1/image", params={"mode": a.api_mode}, timeout=a.timeout)
+        except requests.RequestException as e:
+            stop = f"GET ไม่ได้ ({type(e).__name__})"
+            break
+        row["get_s"] = round(time.perf_counter() - t, 3)
+        if r.status_code != 200:
+            stop = f"GET HTTP {r.status_code} {STOP_STATUS.get(r.status_code, r.text[:120])}"
+            break
+        img_id, name = r.headers.get("X-Image-ID", ""), r.headers.get("X-Image-Name", "")
+        if not img_id or not name:
+            stop = "GET ไม่มี header X-Image-ID / X-Image-Name"
+            break
+        name = Path(name).name  # กันชื่อมี path
+        row.update(image_name=name, img_id=img_id)
+
+        t0 = time.perf_counter()
+        rgb, objects, inst = None, [], None
+        try:
+            with Image.open(io.BytesIO(r.content)) as im:
                 rgb = np.asarray(ImageOps.exif_transpose(im).convert("RGB"))
         except Exception as e:  # noqa: BLE001
-            log("IMG", f"อ่าน {f.name} ไม่ได้: {e} — ข้าม")
-            continue
-        seen.add(f.stem.casefold())
-        inst, objects = inf.predict(net, imgsz, rgb, ia)
-        msg = inf.mqtt_message(f.name, objects, time.perf_counter() - t0)
+            log("IMG", f"{name}: decode ไม่ได้ ({e}) — ส่ง objects ว่าง")
+        t1 = time.perf_counter()
+        if rgb is not None:
+            inst, objects = inf.predict(net, imgsz, rgb, ia)
+        t2 = time.perf_counter()
+        row.update(decode_s=round(t1 - t0, 3), predict_s=round(t2 - t1, 3), n_objects=len(objects))
+
+        status, resp = post_submit(s, cfg, {"img_id": img_id, "predictions": {"image_name": name, "objects": objects}},
+                                   a.timeout)
+        row["post_s"] = round(time.perf_counter() - t2, 3)
+        row["http_status"] = status
+        if status == 200 and isinstance(resp, dict):
+            row["duration_seconds"] = resp.get("duration_seconds", "")
+        else:
+            failed += 1
+
+        msg = inf.mqtt_message(name, objects, t2 - t0)
         payload = json.dumps(msg, ensure_ascii=False)
         if mq:
-            mq.publish(f.name, payload)
-        (a.out / "mqtt" / f"{f.stem}.json").write_text(payload, encoding="utf-8")
-        pending.append(pool.submit(inf.write_outputs, a.out, f.stem, rgb, inst, ia.vis_scale))
-        preds.append({"image_name": f.name, "objects": objects})
-        log("IMG", f"{f.name}: {len(objects)} เม็ด · ทาย+publish {time.perf_counter() - t0:.2f} s")
+            t3 = time.perf_counter()
+            ok, why = mq.publish(payload.encode("utf-8"))
+            row.update(mqtt_s=round(time.perf_counter() - t3, 3), mqtt_ok=int(ok))
+            if not ok:
+                failed += 1
+                log("MQTT", f"{name}: ไม่ผ่าน ({why})")
+        stem = Path(name).stem
+        (a.out / "mqtt" / f"{stem}.json").write_text(payload, encoding="utf-8")
+        if a.save_input:  # หลัง POST + MQTT แล้ว → ไม่กระทบ duration_seconds · ชื่อซ้ำ → ต่อท้าย img_id ไม่เขียนทับ
+            dst = a.save_input / name
+            if dst.exists():
+                dst = a.save_input / f"{stem}__{img_id}{Path(name).suffix}"
+            pending.append(pool.submit(dst.write_bytes, r.content))
+        if inst is not None:
+            pending.append(pool.submit(inf.write_outputs, a.out, stem, rgb, inst, ia.vis_scale))
+        if name in preds:
+            log("IMG", f"{name}: ชื่อซ้ำภาพก่อนหน้า — ไฟล์ในเครื่องเก็บผลครั้งล่าสุด")
+        preds[name] = {"image_name": name, "objects": objects}
+        rows.append(row)
+        note = {408: " ส่งช้าเกินกำหนด", 409: " img_id ซ้ำ — ข้าม"}.get(status, "")
+        if status not in (200, 408, 409):
+            note = f" {STOP_STATUS.get(status, '') or (str(resp)[:120] if resp else 'ต่อไม่ได้')}"
+        log("IMG", f"{i}/{a.count} {name}: {len(objects)} เม็ด · GET {row['get_s']} decode {row['decode_s']} "
+                   f"ทาย {row['predict_s']} POST {row['post_s']} s · HTTP {status}{note} · "
+                   f"duration_seconds {row['duration_seconds'] or '-'}"
+                   + (f" · MQTT {row['mqtt_s']} s {'ok' if row['mqtt_ok'] else 'ไม่ผ่าน'}" if mq else ""))
+        if status in STOP_STATUS:
+            stop = f"POST HTTP {status} {STOP_STATUS[status]}"
+            break
+
     for p in pending:
         p.result()
     pool.shutdown(wait=True)
-    if not preds:
-        raise SystemExit("Error: ไม่ได้ภาพเลย")
-    preds.sort(key=lambda p: p["image_name"].casefold())  # ลำดับเดียวกับ infer.py
-    inf.write_predictions(a.out / "predictions.json", preds)
-    check_outputs(a.out, len(preds))
-
-    result, ths = {}, []
-    if a.only in ("both", "http"):
-        ths.append(threading.Thread(target=task_http, args=(cfg, a, result)))
     if mq:
-        ths.append(threading.Thread(target=mq.finish, args=(result,)))
-    elif a.only in ("both", "mqtt"):
-        result["mqtt"] = False
-    for t in ths:
-        t.start()
-    for t in ths:
-        t.join()
-    return result
-
-
-# ---------- โหมด batch (สำรอง) ----------
-def run_batch(cfg, a):
-    if a.local_input:
-        inp = a.local_input
-        n = sum(1 for _ in local_iter(inp))
-        log("GET", f"ข้าม · ใช้ {n} ภาพจาก {inp}")
-    else:
-        inp = (a.work or a.out.parent / "input").resolve()
-        n = sum(1 for _ in fetch_iter(cfg, inp, a.timeout, a.retries))
-    if not a.skip_infer:
-        cmd = [sys.executable, str(a.infer), "--input", str(inp), "--weights", str(a.weights), "--out", str(a.out)]
-        cmd += shlex.split(a.infer_extra)
-        log("INFER", " ".join(cmd))
-        if subprocess.run(cmd).returncode != 0:
-            raise SystemExit("Error: infer.py ล้ม")
-    msgs = check_outputs(a.out, n)
-    result, ths = {}, []
-    if a.only in ("both", "http"):
-        ths.append(threading.Thread(target=task_http, args=(cfg, a, result)))
-    if a.only in ("both", "mqtt"):
-        def mqtt_all():
-            try:
-                mq = Mqtt(cfg, a)
-                mq.connect()
-                for m in msgs:
-                    mq.publish(m.name, m.read_text(encoding="utf-8"))
-                mq.finish(result)
-            except Exception as e:  # noqa: BLE001
-                log("MQTT", f"ล้ม: {e}")
-                result["mqtt"] = False
-        ths.append(threading.Thread(target=mqtt_all))
-    for t in ths:
-        t.start()
-    for t in ths:
-        t.join()
-    return result
+        mq.close()
+    if rows:
+        with (a.out / "client_times.csv").open("w", newline="", encoding="utf-8") as fp:
+            w = csv.DictWriter(fp, fieldnames=CSV_COLS)
+            w.writeheader()
+            w.writerows(rows)
+    if preds:
+        plist = sorted(preds.values(), key=lambda p: p["image_name"].casefold())  # ลำดับเดียวกับ infer.py
+        inf.write_predictions(a.out / "predictions.json", plist)
+        check_outputs(a.out, len(plist))
+    durs = [float(r["duration_seconds"]) for r in rows if r["duration_seconds"] != ""]
+    if durs:
+        log("SUMMARY", f"duration_seconds (นิยามผู้จัด) {len(durs)} ภาพ: median {statistics.median(durs):.3f} · "
+                       f"max {max(durs):.3f} · min {min(durs):.3f}")
+    log("SUMMARY", f"ส่ง {len(rows)}/{a.count} ภาพ · ไม่ผ่าน {failed}"
+                   + (f" · ผลเวลา {a.out / 'client_times.csv'}" if rows else ""))
+    if stop:
+        log("STOP", stop)
+    return not stop and failed == 0 and len(rows) == a.count
 
 
 def main():
@@ -359,22 +339,26 @@ def main():
     ap.add_argument("--infer", required=True, type=Path, help="infer.py ที่ใช้")
     ap.add_argument("--weights", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path, help="โฟลเดอร์ผล (เช่น outputs/)")
-    ap.add_argument("--repo", required=True, type=Path, help="โฟลเดอร์ repo ที่จะ zip")
-    ap.add_argument("--mode", choices=["stream", "batch"], default="stream")
-    ap.add_argument("--work", type=Path, default=None, help="ที่เก็บภาพที่ GET มา (ค่าเริ่ม <out>/../input)")
-    ap.add_argument("--local-input", type=Path, default=None, help="ข้าม GET ใช้ภาพในโฟลเดอร์นี้")
-    ap.add_argument("--skip-infer", action="store_true", help="(batch) ไม่รัน infer ส่งผลที่มีใน --out")
-    ap.add_argument("--infer-extra", default="", help='argument เพิ่มให้ infer ในเครื่องหมายคำพูด เช่น "--write-mqtt 1"')
-    ap.add_argument("--only", choices=["both", "http", "mqtt"], default="both")
-    ap.add_argument("--timeout", type=float, default=60)
-    ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--count", required=True, type=int, help="จำนวนภาพที่จะ GET")
+    ap.add_argument("--api-mode", choices=["train", "test"], default="train",
+                    help="train = ไม่จำกัด · test = กินโควตา ต้องใส่เอง")
+    ap.add_argument("--skip-mqtt", action="store_true", help="ไม่ต่อ/ไม่ส่ง MQTT (ทดสอบ HTTP)")
+    ap.add_argument("--save-input", type=Path, default=None,
+                    help="เก็บไบต์ภาพที่ GET มาลงโฟลเดอร์นี้ (หลัง POST/MQTT) · ค่าเริ่ม: ไม่เก็บ")
+    ap.add_argument("--timeout", type=float, default=30, help="วินาที ต่อคำขอ HTTP / รอ ack MQTT")
+    ap.add_argument("--infer-extra", default="", help='argument เพิ่มให้ infer ในเครื่องหมายคำพูด เช่น "--conf 0.3"')
     a = ap.parse_args()
-
-    cfg = json.loads(a.config.read_text(encoding="utf-8"))
-    a.repo, a.out = a.repo.resolve(), a.out.resolve()
-    result = run_stream(cfg, a) if a.mode == "stream" else run_batch(cfg, a)
-    log("DONE", f"{result}")
-    sys.exit(0 if result and all(result.values()) else 1)
+    if a.count < 1:
+        raise SystemExit("Error: --count ต้อง ≥ 1")
+    cfg = load_config(a.config, a.skip_mqtt)
+    a.out = a.out.resolve()
+    if a.save_input:
+        a.save_input = a.save_input.resolve()
+        if a.save_input == a.out or a.out in a.save_input.parents:
+            raise SystemExit("Error: --save-input ต้องอยู่นอก --out (--out ถูกล้างทุกรอบ)")
+        a.save_input.mkdir(parents=True, exist_ok=True)
+    ok = run(cfg, a)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
