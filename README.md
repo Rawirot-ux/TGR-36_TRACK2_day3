@@ -11,7 +11,7 @@ Model: YOLO26n-seg fine-tuned, exported to NCNN fp32 640 · inference uses only 
 | `client.py` | **Day 3 integration** (organiser API docs) — per image: GET `/api/v1/image` → predict → POST `/api/v1/submit` (JSON polygons) → MQTT publish over WebSocket TLS 443; MQTT connected *before* the first GET |
 | `client_config.example.json` | Template for organiser endpoints/credentials — copy to `client_config.json` (git-ignored, never committed) |
 | `train.py` | Reproduces `weights/best.pt` (2 training stages + NCNN export) |
-| `weights/best.pt` | Trained model (Day 3 stage-3 `last.pt` = run E3, md5 `f122e708d7a76dcec172bb3ef65ae8f1`) |
+| `weights/best.pt` | Trained model (Day 3 stage-3 `last.pt` = run E4, md5 `2c3c89bcf78492e6b41b6103c9b20cfd`) |
 | `weights/best_ncnn_model/` | NCNN export used by inference (`model.ncnn.param/.bin`, `metadata.yaml`, imgsz 640) |
 | `requirements.txt` | Inference + client dependencies (Pi) |
 
@@ -65,19 +65,20 @@ The prediction functions are imported from `infer.py`, so `outputs/` is byte-ide
 
 Options: `--skip-mqtt` · `--save-input <dir>` (keep the raw downloaded images, written after POST/MQTT, outside `--out`) · `--timeout` (s, per HTTP request / MQTT ack, default 30) · `--infer-extra "--conf 0.3"`.
 
-## Day 3 model (E3)
+## Day 3 model (E4)
 
-Stage 3: fine-tuned from the Day 2 model (stage-2 `last.pt`) for 40 epochs at 640 (AdamW lr0 0.001, batch 8, seed 0, `last.pt` used) on 433 images: the 140 Day 2 touching piles + 13 of the 16 Day 3 organiser photos + 140 synthetic mixed-class piles (15–35 beans) + 140 dense overlapping piles (35–50 beans, up to 55 % occlusion), all piles made only from those 13 photos. The other 3 Day 3 photos (`Mixed_square2`, `Mixed_grid1`, `Mixed_triangle4`, 23 beans) are never trained on. E1 (same settings without the 140 dense piles) is kept as the fallback.
+Stage 3: fine-tuned from the Day 2 model (stage-2 `last.pt`) for 40 epochs at 640 (AdamW lr0 0.001, batch 8, seed 0, `last.pt` used) on 436 images: the 140 Day 2 touching piles + all 16 Day 3 organiser photos + 140 synthetic mixed-class piles (15–35 beans) + 140 dense overlapping piles (35–50 beans, up to 55 % occlusion), all piles made from those 16 photos.
+E4 is the E3 recipe with one change, the data: E3 kept 3 Day 3 photos (`Mixed_square2`, `Mixed_grid1`, `Mixed_triangle4`, 23 beans) out of training as a test set; E4 also trains on them (more real beans: 101 → 124). So the first three rows below test the recipe (E3 never saw those beans), not E4. E3 and E1 (E3 without the 140 dense piles) are kept as fallbacks.
 
-| Test set (default inference, IoU+count score /15) | Day 2 model | E1 | **E3 (submitted)** |
-|---|---|---|---|
-| 3 held-out Day 3 photos, 23 beans | 14.46 | 14.71 | **14.71** (class correct 16/23 vs 10/23) |
-| 30 synthetic mixed-class piles from those 23 beans, 745 beans | 4.96 | 12.28 | **12.68** |
-| 30 dense overlapping piles from those 23 beans, 1,272 beans | 3.19 | 10.11 | **11.23** |
-| 70 touching piles from held-out Day 1 grid photos, 1,971 beans | 14.42 | 14.39 | **14.48** |
-| 3 external photos (Amostra 100g v13, CC BY 4.0), 798 beans | — | 5.36 | **7.41** |
+| Test set (default inference, IoU+count score /15) | Day 2 model | E1 | E3 | **E4 (submitted)** |
+|---|---|---|---|---|
+| 3 held-out Day 3 photos, 23 beans | 14.46 | 14.71 | 14.71 (class correct 16/23 vs 10/23) | trained on |
+| 30 synthetic mixed-class piles from those 23 beans, 745 beans | 4.96 | 12.28 | 12.68 | trained on |
+| 30 dense overlapping piles from those 23 beans, 1,272 beans | 3.19 | 10.11 | 11.23 | trained on |
+| 70 touching piles from held-out Day 1 grid photos, 1,971 beans | 14.42 | 14.39 | 14.48 | **14.41** |
+| 3 external photos (Amostra 100g v13, CC BY 4.0), 798 beans | — | 5.36 | 7.41 | not measured |
 
-Raspberry Pi, `infer.py` median per image on 3 dense piles (read + infer + write, model load excluded): E1 0.77 s · E3 0.77 s.
+Raspberry Pi, `infer.py` median per image on 3 dense piles (read + infer + write, model load excluded): E1 0.77 s · E3 0.77 s. Second run, same Pi and piles, alternating E3/E4/E3/E4: E3 0.79 / 0.82 s · E4 0.78 / 0.78 s (same network, `model.ncnn.param` identical).
 
 ## Pipeline (per image)
 
