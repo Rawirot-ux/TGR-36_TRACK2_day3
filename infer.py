@@ -11,6 +11,7 @@ infer_seg_ncnn.py — ต้นแบบ infer Day 2 (YOLO-seg NCNN · ncnn + nu
   - --write-mqtt (Day 3, ตัวส่งค่าเริ่ม 1): <out>/mqtt/<stem>.json ภาพละไฟล์ ตามสไลด์ Day 3 หน้า 7
     {"image", "latency_ms", "counts" 7 key ครบ, "defect_ratio" = เม็ดที่ไม่ใช่ good ÷ ทั้งหมด}
     counts นับจาก objects ชุดเดียวกับ predictions.json/seg_mask → ตรงกันเสมอ
+  - --poly-simple (Day 3, ตัวส่งค่าเริ่ม 1): polygon เก็บเฉพาะจุดหักมุม (= CHAIN_APPROX_SIMPLE · รูปเดิม · seg_mask ไม่เปลี่ยน)
 error ที่หยุดทั้งรัน (exit 1): input/weights ไม่พบ · ไม่มีภาพ · อ่านภาพไม่ได้ · ผลผิดรูปแบบ
 
 ตัวส่ง: ค่าเริ่ม = refine color band 20 (distance transform) + เขียนไฟล์เบื้องหลัง + เขียนทับ --out ได้ + mqtt/ → python infer.py --input test/ --weights weights/ --out outputs/
@@ -116,6 +117,14 @@ def paper_lab(lab_small):
     return np.median(b, axis=0)
 
 
+def poly_simple(p):
+    """ตัดจุดกลางเส้นตรงของ contour แบบ CHAIN_APPROX_NONE (ทิศก้าวเข้า = ทิศก้าวออก) = CHAIN_APPROX_SIMPLE
+    รูป polygon เดิมทางเรขาคณิต (จุดที่ตัดอยู่บนเส้นตรงระหว่างจุดที่เก็บ) · เหลือ < 3 จุด → คืนของเดิม"""
+    d = np.diff(np.vstack([p, p[:1]]), axis=0)  # d[i] = p[i+1] - p[i]
+    keep = (d != np.roll(d, 1, axis=0)).any(1)
+    return p[keep] if keep.sum() >= 3 else p
+
+
 def predict(net, imgsz, rgb, a):
     H, W = rgb.shape[:2]
     canvas, r, left, top = letterbox(rgb, imgsz)
@@ -202,6 +211,8 @@ def predict(net, imgsz, rgb, a):
         oid = len(objects) + 1
         inst[y1:y2, x1:x2][filled.astype(bool)] = oid
         pts = (c[:, 0, :] + [x1, y1]).astype(int)
+        if a.poly_simple:
+            pts = poly_simple(pts)
         objects.append({"id": oid, "class": CLASSES[int(cls[idx[k]])], "polygon": pts.tolist()})
     return inst, objects
 
@@ -275,6 +286,8 @@ def build_parser():
                     help="1 = --out มีอยู่แล้วได้ (ลบ seg_mask/ vis/ mqtt/ predictions.json เดิมแล้วเขียนใหม่)")
     ap.add_argument("--write-mqtt", type=int, choices=[0, 1], default=1,
                     help="1 = เขียน <out>/mqtt/<stem>.json ภาพละไฟล์ (ข้อความ MQTT Day 3)")
+    ap.add_argument("--poly-simple", type=int, choices=[0, 1], default=1,
+                    help="1 = polygon เก็บเฉพาะจุดหักมุม (รูปเดิม JSON เล็กลง ~half) · 0 = ทุกพิกเซลบนขอบ")
     return ap
 
 

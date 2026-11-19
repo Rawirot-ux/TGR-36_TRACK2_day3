@@ -185,9 +185,12 @@ def get_stats(s, cfg, timeout):
 
 def post_submit(s, cfg, body, timeout):
     """คืน (status, json|None) · ต่อเซิร์ฟเวอร์ไม่ได้ → ลองซ้ำ 1 ครั้ง (ถ้าได้ 409 ตอนซ้ำ = ครั้งแรกอาจบันทึกแล้ว)"""
+    # JSON ไม่เว้นวรรค (ข้อมูลเดิมทุกค่า · ไฟล์เล็กลง → POST เร็วขึ้น) · แทน json=body ของ requests
+    data = json.dumps(body, separators=(",", ":"), allow_nan=False).encode("utf-8")
     for attempt in (1, 2):
         try:
-            r = s.post(f"{cfg['http_url']}/api/v1/submit", json=body, timeout=timeout)
+            r = s.post(f"{cfg['http_url']}/api/v1/submit", data=data,
+                       headers={"Content-Type": "application/json"}, timeout=timeout)
             try:
                 d = r.json()
             except ValueError:
