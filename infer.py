@@ -176,17 +176,19 @@ def predict(net, imgsz, rgb, a):
         box_m[max(0, by1):by2, max(0, bx1):bx2] = 1
         m &= box_m
         if a.refine == "color" and m.any():
-            lab = cv2.cvtColor(rgb[y1:y2, x1:x2], cv2.COLOR_RGB2LAB).astype(np.float32)
-            dist = np.sqrt(((lab - paper) ** 2).sum(-1))
-            chroma = np.sqrt(((lab[..., 1:] - paper[1:]) ** 2).sum(-1))
-            fg = (dist > a.fg_dist) & ~((chroma < a.shadow_chroma) & (lab[..., 0] > paper[0] - 60))
             if a.band_method == "dt":  # ระยะถึงขอบด้วย distance transform (เร็วกว่าวงรี ~9 เท่า)
                 din = cv2.distanceTransform(m, cv2.DIST_L2, 5)
                 dout = cv2.distanceTransform(1 - m, cv2.DIST_L2, 5)
                 band = (din <= a.band + 0.5) & (dout <= a.band + 0.5)
             else:
                 band = cv2.dilate(m, kband).astype(bool) & ~cv2.erode(m, kband).astype(bool)
-            m = np.where(band, fg, m.astype(bool)).astype(np.uint8)
+            if band.any():
+                pixels = rgb[y1:y2, x1:x2][band]
+                lab = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+                dist = np.sqrt(((lab - paper) ** 2).sum(-1))
+                chroma = np.sqrt(((lab[..., 1:] - paper[1:]) ** 2).sum(-1))
+                fg = (dist > a.fg_dist) & ~((chroma < a.shadow_chroma) & (lab[..., 0] > paper[0] - 60))
+                m[band] = fg
         owned = inst[y1:y2, x1:x2] != 0
         m[owned] = 0
         n, lbl, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
