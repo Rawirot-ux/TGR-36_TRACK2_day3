@@ -1,0 +1,16 @@
+{
+  "team": "36",
+  "get_url": "http://<organiser-host>/<get-images-path>",
+  "post_url": "http://<organiser-host>/<submit-path>",
+  "post_results_field": "results",
+  "post_zip_field": "zip",
+  "post_extra_fields": {"team": "36"},
+  "http_headers": {},
+  "mqtt_host": "<broker-host>",
+  "mqtt_port": 1883,
+  "mqtt_user": "<user>",
+  "mqtt_password": "",
+  "mqtt_topic": "<topic>",
+  "mqtt_tls": false,
+  "mqtt_qos": 1
+}

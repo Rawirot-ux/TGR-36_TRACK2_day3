@@ -1,0 +1,10 @@
+# credentials (repo is public) — keep only the example
+client_config*.json
+!client_config.example.json
+.env
+# runtime data
+input/
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
