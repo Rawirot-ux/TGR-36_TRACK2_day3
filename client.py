@@ -260,7 +260,8 @@ def run(cfg, a):
         rgb, objects, inst = None, [], None
         try:
             with Image.open(io.BytesIO(r.content)) as im:
-                rgb = np.asarray(ImageOps.exif_transpose(im).convert("RGB"))
+                ImageOps.exif_transpose(im, in_place=True)  # หมุนตาม EXIF ในตัวภาพเลย ไม่ก๊อป (ผลเท่าเดิม)
+                rgb = np.asarray(im if im.mode == "RGB" else im.convert("RGB"))  # RGB อยู่แล้ว → ไม่ก๊อปซ้ำ (ผลเท่าเดิม)
         except Exception as e:  # noqa: BLE001
             log("IMG", f"{name}: decode ไม่ได้ ({e}) — ส่ง objects ว่าง")
         t1 = time.perf_counter()

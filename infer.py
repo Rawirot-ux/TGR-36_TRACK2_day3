@@ -368,7 +368,8 @@ def main():
         starts.append(t0)
         try:
             with Image.open(f) as im:
-                rgb = np.asarray(ImageOps.exif_transpose(im).convert("RGB"))
+                ImageOps.exif_transpose(im, in_place=True)  # หมุนตาม EXIF ในตัวภาพเลย ไม่ก๊อป (ผลเท่าเดิม)
+                rgb = np.asarray(im if im.mode == "RGB" else im.convert("RGB"))  # RGB อยู่แล้ว → ไม่ก๊อปซ้ำ (ผลเท่าเดิม)
         except Exception as e:  # noqa: BLE001
             raise SystemExit(f"Error: อ่านภาพไม่ได้ {f.name}: {e}")
         inst, objects = predict(net, imgsz, rgb, a)
