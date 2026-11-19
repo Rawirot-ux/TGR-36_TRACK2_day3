@@ -8,10 +8,10 @@ Model: YOLO26n-seg fine-tuned, exported to NCNN fp32 640 · inference uses only 
 | Path | What |
 |---|---|
 | `infer.py` | **Inference (submission)** — fast, never aborts on mask holes, refines mask edges with image colour (default) |
-| `client.py` | **Day 3 integration** — GET test images over HTTP → `infer.py` → POST `results.json` + `team_36_Day3.zip` and publish one MQTT message per image, in parallel |
+| `client.py` | **Day 3 integration** — model loaded + MQTT connected *before* the GET; each image is published to MQTT right after its prediction; then POST `results.json` + `team_36_Day3.zip` |
 | `client_config.example.json` | Template for organiser endpoints/credentials — copy to `client_config.json` (git-ignored, never committed) |
 | `train.py` | Reproduces `weights/best.pt` (2 training stages + NCNN export) |
-| `weights/best.pt` | Trained model (stage-2 `last.pt`, md5 `76628505935e23a38a835a87faf26ed5`) |
+| `weights/best.pt` | Trained model (Day 3 stage-3 `last.pt` = run E1, md5 `245cc0b18d41e7e5318e1eae3843c8f6`) |
 | `weights/best_ncnn_model/` | NCNN export used by inference (`model.ncnn.param/.bin`, `metadata.yaml`, imgsz 640) |
 | `requirements.txt` | Inference + client dependencies (Pi) |
 
@@ -50,12 +50,28 @@ export MQTT_PASSWORD='...'                          # or put it in client_config
 python client.py --config client_config.json --infer infer.py --weights weights/ --out outputs/ --repo .
 ```
 
-1. GET `get_url` → images saved to `input/` (zip, single image, or JSON list of URLs are accepted)
-2. Runs `python infer.py --input input/ --weights weights/ --out outputs/`, then checks that every image has a `predictions.json` entry and an `mqtt/` file with matching counts
-3. In parallel: **HTTP** POST multipart `results.json` (= `outputs/predictions.json`) + `team_36_Day3.zip` (this repo incl. `outputs/`, without `.git`, `input/`, configs) · **MQTT** publish each `outputs/mqtt/*.json` to `mqtt_topic` (QoS 1, waits for broker ack)
-4. Each step retries 3×; exit code 1 if HTTP or any MQTT message failed (the other task still completes)
+Organiser rule (19 Nov): Day 3 latency = from the HTTP release of the images until the MQTT message arrives, and all marks are submitted over HTTP. So the default `--mode stream`:
 
-Options: `--local-input <folder>` skip GET · `--skip-infer` resend existing outputs · `--only http|mqtt` · `--retries` · `--timeout`.
+0. loads the NCNN model, runs a warm-up and connects to the MQTT broker **before** requesting images
+1. GET `get_url` → `input/` (zip, single image, or JSON list of URLs; with a list, each image is processed as soon as it is downloaded)
+2. per image: predict → **publish MQTT immediately** → write `outputs/mqtt/<stem>.json`; `seg_mask/` and `vis/` are written in a background thread
+3. after the last image: `outputs/predictions.json` (same writer as `infer.py`), check that every MQTT count matches it, then POST `results.json` + `team_36_Day3.zip` while waiting for MQTT acknowledgements (unacknowledged messages are re-sent)
+4. HTTP and MQTT are independent: a broker failure never blocks the HTTP submission; exit code 1 if either failed
+
+The prediction functions are imported from `infer.py`, so `outputs/` is byte-identical to running `python infer.py --input input/ --weights weights/ --out outputs/` (except the measured `latency_ms`).
+`--mode batch` (fallback) runs `infer.py` as a subprocess on all images first, then publishes and POSTs.
+
+Options: `--local-input <folder>` skip GET · `--mode batch --skip-infer` resend existing outputs · `--only http|mqtt` · `--retries` · `--timeout`.
+
+## Day 3 model (E1)
+
+Stage 3: fine-tuned from the Day 2 model (stage-2 `last.pt`) for 40 epochs at 640 on 293 images: the 140 Day 2 touching piles + 13 of the 16 Day 3 organiser photos + 140 synthetic mixed-class piles made only from those 13 photos (same hyper-parameters as stage 2). The other 3 Day 3 photos (`Mixed_square2`, `Mixed_grid1`, `Mixed_triangle4`, 23 beans) are never trained on.
+
+| Test set (default inference) | Day 2 model | **Day 3 model (E1)** |
+|---|---|---|
+| 3 held-out Day 3 photos, 23 beans: IoU+count score /15 | 14.46 | **14.71** |
+| 30 synthetic mixed-class piles from those 23 beans, 745 beans: /15 | 4.96 | **12.28** |
+| 70 touching piles from held-out Day 1 grid photos, 1,971 beans: /15 | 14.42 | 14.39 |
 
 ## Pipeline (per image)
 

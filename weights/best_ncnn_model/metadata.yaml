@@ -1,6 +1,6 @@
-description: Ultralytics YOLO26n-seg model trained on /Users/stamp/Desktop/TGR2026-day2/datasets/day2_seg7_touch_v2/data.yaml
+description: Ultralytics YOLO26n-seg model trained on /Users/stamp/Desktop/TGR2026-day2/datasets/day3_seg7_mixed_v1/data.yaml
 author: Ultralytics
-date: "2026-11-18T14:08:07.067772+07:00"
+date: "2026-11-19T10:34:31.074695+07:00"
 version: "8.4.208"
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com

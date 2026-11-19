@@ -222,7 +222,36 @@ def save_vis(path, rgb, inst, scale):
     cv2.imwrite(str(path), out[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
 
 
-def main():
+def write_outputs(out, stem, rgb, inst, vis_scale):
+    if not cv2.imwrite(str(out / "seg_mask" / f"{stem}.png"), inst, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+        raise RuntimeError(f"เขียน seg_mask ไม่ได้ {stem}")
+    save_vis(out / "vis" / f"{stem}.jpg", rgb, inst, vis_scale)
+
+
+def write_predictions(target, preds):
+    """predictions.json รูปแบบเดียวกับ infer.py เพื่อน: 1 ภาพ/1 เม็ด ต่อบรรทัด · อ่านกลับตรวจ"""
+    with target.open("w", encoding="utf-8") as fp:
+        fp.write("[\n")
+        for i, p in enumerate(preds):
+            fp.write('  {\n    "image_name": ' + json.dumps(p["image_name"], ensure_ascii=False)
+                     + ',\n    "objects": [')
+            for j, o in enumerate(p["objects"]):
+                fp.write(("\n" if j == 0 else ",\n") + "      " + json.dumps(o, ensure_ascii=False, allow_nan=False))
+            fp.write(("\n    " if p["objects"] else "") + "]\n  }" + (",\n" if i + 1 < len(preds) else "\n"))
+        fp.write("]\n")
+    if json.loads(target.read_text(encoding="utf-8")) != preds:
+        raise SystemExit("Error: predictions.json อ่านกลับไม่ตรงกับผล")
+
+
+def clear_out(out):
+    """ลบเฉพาะผลเดิมของสคริปต์นี้ (seg_mask/, vis/, mqtt/, predictions.json) ไม่แตะไฟล์อื่น"""
+    for sub in ("seg_mask", "vis", "mqtt"):
+        if (out / sub).is_dir():
+            shutil.rmtree(out / sub)
+    (out / "predictions.json").unlink(missing_ok=True)
+
+
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", required=True, type=Path)
     ap.add_argument("--weights", required=True, type=Path)
@@ -246,7 +275,11 @@ def main():
                     help="1 = --out มีอยู่แล้วได้ (ลบ seg_mask/ vis/ mqtt/ predictions.json เดิมแล้วเขียนใหม่)")
     ap.add_argument("--write-mqtt", type=int, choices=[0, 1], default=1,
                     help="1 = เขียน <out>/mqtt/<stem>.json ภาพละไฟล์ (ข้อความ MQTT Day 3)")
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
 
     if not a.input.exists():
         raise SystemExit(f"Error: ไม่พบ input {a.input}")
@@ -266,11 +299,7 @@ def main():
             raise SystemExit(f"Error: --out ต้องเป็นโฟลเดอร์ใหม่หรือว่าง: {a.out}")
         if a.input.resolve() == a.out.resolve() or a.out.resolve() in a.input.resolve().parents:
             raise SystemExit("Error: --out ซ้อนกับ --input")
-        # ลบเฉพาะผลเดิมของสคริปต์นี้ (seg_mask/, vis/, predictions.json) ไม่แตะไฟล์อื่น
-        for sub in ("seg_mask", "vis", "mqtt"):
-            if (a.out / sub).is_dir():
-                shutil.rmtree(a.out / sub)
-        (a.out / "predictions.json").unlink(missing_ok=True)
+        clear_out(a.out)
         print(f"เขียนทับผลเดิมใน {a.out}", flush=True)
     cv2.setNumThreads(a.threads)
     net, imgsz = load_model(a.weights, a.threads)
@@ -278,11 +307,6 @@ def main():
     (a.out / "vis").mkdir(exist_ok=True)
     run_net(net, np.full((imgsz[0], imgsz[1], 3), 114, np.uint8))  # warm-up
     preds, times = [], []
-
-    def write_outputs(stem, rgb, inst):
-        if not cv2.imwrite(str(a.out / "seg_mask" / f"{stem}.png"), inst, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
-            raise RuntimeError(f"เขียน seg_mask ไม่ได้ {stem}")
-        save_vis(a.out / "vis" / f"{stem}.jpg", rgb, inst, a.vis_scale)
 
     # --async-write 1: เขียนไฟล์ภาพก่อนหน้าในเธรดเบื้องหลัง ขณะอ่าน/ทายภาพถัดไป (cv2.imwrite ปล่อย GIL)
     # ไฟล์ผลเหมือนโหมดปกติทุกไบต์ · คิวไม่เกิน 2 ภาพ · เวลารายภาพ = ช่วงห่างระหว่างภาพ (รวมรอเขียนตอนท้าย)
@@ -308,10 +332,10 @@ def main():
         inst, objects = predict(net, imgsz, rgb, a)
         if pool:
             drain(1)
-            pending.append(pool.submit(write_outputs, f.stem, rgb, inst))
+            pending.append(pool.submit(write_outputs, a.out, f.stem, rgb, inst, a.vis_scale))
         else:
             try:
-                write_outputs(f.stem, rgb, inst)
+                write_outputs(a.out, f.stem, rgb, inst, a.vis_scale)
             except RuntimeError as e:
                 raise SystemExit(f"Error: {e}")
         preds.append({"image_name": f.name, "objects": objects})
@@ -325,18 +349,7 @@ def main():
         pool.shutdown(wait=True)
         ends = starts[1:] + [time.perf_counter()]
         times = [e - s for s, e in zip(starts, ends)]
-    target = a.out / "predictions.json"
-    with target.open("w", encoding="utf-8") as fp:  # รูปแบบเดียวกับ infer.py เพื่อน: 1 ภาพ/1 เม็ด ต่อบรรทัด
-        fp.write("[\n")
-        for i, p in enumerate(preds):
-            fp.write('  {\n    "image_name": ' + json.dumps(p["image_name"], ensure_ascii=False)
-                     + ',\n    "objects": [')
-            for j, o in enumerate(p["objects"]):
-                fp.write(("\n" if j == 0 else ",\n") + "      " + json.dumps(o, ensure_ascii=False, allow_nan=False))
-            fp.write(("\n    " if p["objects"] else "") + "]\n  }" + (",\n" if i + 1 < len(preds) else "\n"))
-        fp.write("]\n")
-    if json.loads(target.read_text(encoding="utf-8")) != preds:
-        raise SystemExit("Error: predictions.json อ่านกลับไม่ตรงกับผล")
+    write_predictions(a.out / "predictions.json", preds)
     if a.write_mqtt:
         (a.out / "mqtt").mkdir(exist_ok=True)
         for f, p, t in zip(files, preds, times):
