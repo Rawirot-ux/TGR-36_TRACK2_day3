@@ -295,7 +295,8 @@ def run(cfg, a):
                 dst = a.save_input / f"{stem}__{img_id}{Path(name).suffix}"
             pending.append(pool.submit(dst.write_bytes, r.content))
         if inst is not None:
-            pending.append(pool.submit(inf.write_outputs, a.out, stem, rgb, inst, ia.vis_scale))
+            pending.append(pool.submit(inf.write_outputs, a.out, stem, rgb, inst, ia.vis_scale,
+                                       objects if ia.vis_classes else ()))  # ป้ายคลาสใน vis (หลัง POST/MQTT)
         if name in preds:
             log("IMG", f"{name}: ชื่อซ้ำภาพก่อนหน้า — ไฟล์ในเครื่องเก็บผลครั้งล่าสุด")
         preds[name] = {"image_name": name, "objects": objects}

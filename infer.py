@@ -12,6 +12,7 @@ infer_seg_ncnn.py — ต้นแบบ infer Day 2 (YOLO-seg NCNN · ncnn + nu
     {"image", "latency_ms", "counts" 7 key ครบ, "defect_ratio" = เม็ดที่ไม่ใช่ good ÷ ทั้งหมด}
     counts นับจาก objects ชุดเดียวกับ predictions.json/seg_mask → ตรงกันเสมอ
   - --poly-simple (Day 3, ตัวส่งค่าเริ่ม 1): polygon เก็บเฉพาะจุดหักมุม (= CHAIN_APPROX_SIMPLE · รูปเดิม · seg_mask ไม่เปลี่ยน)
+  - --vis-classes (Day 3, ค่าเริ่ม 1): ป้าย "#id คลาส" ข้างแต่ละเม็ดใน vis/ (id = ลำดับใน predictions.json) · ไม่กระทบ predictions/seg_mask/mqtt
 error ที่หยุดทั้งรัน (exit 1): input/weights ไม่พบ · ไม่มีภาพ · อ่านภาพไม่ได้ · ผลผิดรูปแบบ
 
 ตัวส่ง: ค่าเริ่ม = refine color band 20 (distance transform) + เขียนไฟล์เบื้องหลัง + เขียนทับ --out ได้ + mqtt/ → python infer.py --input test/ --weights weights/ --out outputs/
@@ -217,7 +218,32 @@ def predict(net, imgsz, rgb, a):
     return inst, objects
 
 
-def save_vis(path, rgb, inst, scale):
+def draw_class_labels(out, inst, objects, scale):
+    height, width = inst.shape
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.45, min(1.0, width / 1900))
+    thickness = 2 if font_scale >= 0.7 else 1
+    occupied = np.zeros_like(inst, dtype=np.uint8)
+    for obj in objects:
+        x, y, w, h = cv2.boundingRect(np.rint(np.asarray(obj["polygon"]) * scale).astype(np.int32))
+        text = f"#{obj['id']} {obj['class']}"
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        bw, bh = tw + 10, th + baseline + 8
+        candidates = [(x + (w - bw) // 2, y - bh), (x + (w - bw) // 2, y + h),
+                      (x + w, y + (h - bh) // 2), (x - bw, y + (h - bh) // 2)]
+        positions = [(max(0, min(px, width - bw)), max(0, min(py, height - bh))) for px, py in candidates]
+        def cost(pos):
+            px, py = pos
+            region = np.s_[py:py+bh, px:px+bw]
+            return (np.count_nonzero(occupied[region]), np.count_nonzero(inst[region]))
+        px, py = min(positions, key=cost)
+        occupied[py:py+bh, px:px+bw] = 1
+        cv2.rectangle(out, (px, py), (px+bw-1, py+bh-1), (22, 31, 40), -1)
+        cv2.putText(out, text, (px+5, py+4+th), font, font_scale,
+                    (255, 255, 255), thickness, cv2.LINE_AA)
+
+
+def save_vis(path, rgb, inst, scale, labels=()):
     if scale != 1:
         rgb = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         inst = cv2.resize(inst, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -230,13 +256,15 @@ def save_vis(path, rgb, inst, scale):
     out[fg] = ((out[fg].astype(np.uint16) + pal[inst[fg]]) // 2).astype(np.uint8)
     edge = cv2.morphologyEx((inst > 0).astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
     out[edge > 0] = (255, 0, 0)
+    if labels:
+        draw_class_labels(out, inst, labels, scale)
     cv2.imwrite(str(path), out[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
 
 
-def write_outputs(out, stem, rgb, inst, vis_scale):
+def write_outputs(out, stem, rgb, inst, vis_scale, labels=()):
     if not cv2.imwrite(str(out / "seg_mask" / f"{stem}.png"), inst, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
         raise RuntimeError(f"เขียน seg_mask ไม่ได้ {stem}")
-    save_vis(out / "vis" / f"{stem}.jpg", rgb, inst, vis_scale)
+    save_vis(out / "vis" / f"{stem}.jpg", rgb, inst, vis_scale, labels)
 
 
 def write_predictions(target, preds):
@@ -280,6 +308,7 @@ def build_parser():
     ap.add_argument("--fg-dist", type=float, default=18.0, help="(refine color) ระยะ Lab จากกระดาษที่นับเป็นเม็ด")
     ap.add_argument("--shadow-chroma", type=float, default=6.0, help="(refine color) เทาใกล้กระดาษ = เงา")
     ap.add_argument("--vis-scale", type=float, default=0.5)
+    ap.add_argument("--vis-classes", type=int, choices=[0, 1], default=1, help="1 = ป้าย #id คลาส ข้างแต่ละเม็ดใน vis (ค่าเริ่ม) · 0 = vis แบบเดิม")
     ap.add_argument("--async-write", type=int, choices=[0, 1], default=1,
                     help="1 = เขียน seg_mask/vis ในเธรดเบื้องหลังขณะทายภาพถัดไป (ผลเหมือนเดิมทุกไบต์)")
     ap.add_argument("--allow-existing-out", type=int, choices=[0, 1], default=1,
@@ -345,10 +374,10 @@ def main():
         inst, objects = predict(net, imgsz, rgb, a)
         if pool:
             drain(1)
-            pending.append(pool.submit(write_outputs, a.out, f.stem, rgb, inst, a.vis_scale))
+            pending.append(pool.submit(write_outputs, a.out, f.stem, rgb, inst, a.vis_scale, objects if a.vis_classes else ()))
         else:
             try:
-                write_outputs(a.out, f.stem, rgb, inst, a.vis_scale)
+                write_outputs(a.out, f.stem, rgb, inst, a.vis_scale, objects if a.vis_classes else ())
             except RuntimeError as e:
                 raise SystemExit(f"Error: {e}")
         preds.append({"image_name": f.name, "objects": objects})
